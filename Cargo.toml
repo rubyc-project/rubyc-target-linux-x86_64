@@ -1,0 +1,12 @@
+[package]
+name = "rubyc-target-linux-x86_64"
+version.workspace = true
+edition.workspace = true
+autotests = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+rubyc-core = { path = "../../.." }
+rubyc-target = { path = "../rubyc-target" }
