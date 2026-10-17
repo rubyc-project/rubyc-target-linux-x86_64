@@ -93,6 +93,17 @@ impl CodeGenBackend for Backend {
             data.extend(std::iter::repeat_n(0u8, row.len() * 8));
         }
         e.vtable_offsets = vtable_offsets.clone();
+        // TEMP-VTOFF: dump vtable row offsets for binary correlation.
+        // Removed before close.
+        if std::env::var("RUBYC_VTOFF").is_ok() {
+            for (i, ((n, r), off)) in program.vtables.iter().zip(vtable_offsets.iter()).enumerate() {
+                let spec = std::env::var("RUBYC_VTOFF").unwrap_or_default();
+                if spec == "1" && n != "System.DateTime" {
+                    continue;
+                }
+                eprintln!("[rubyc] TEMP-VTOFF row={i} {n} off={off} len={}", r.len());
+            }
+        }
 
         // Static field storage: one zero-initialized 8-byte slot per
         // `Program::statics`, appended after the vtable words. Zero is the
@@ -322,6 +333,7 @@ impl CodeGenBackend for Backend {
             init_fn: program.init,
             relocs: all_relocs,
             heap_size: program.heap_size,
+            strip_symbols: false,
         })
     }
 
@@ -640,7 +652,13 @@ impl<'p> Emitter<'p> {
         }
 
         // Incoming ABI values materialize into their homes: receiver from
-        // ARG[0], parameter i from ARG[1+i].
+        // ARG[0], parameter i from ARG[1+i]; argv[6..] arrive on the
+        // stack above rbp ([rbp+16+8k]) and MUST be loaded from there
+        // (the old clamp re-read r9 for all of them, scrambling every
+        // 7th+ argument — e.g. `new TimeZoneInfo(..., rules: null, …)`
+        // received garbage rules and entered validation loops).
+        // Instance: VReg(j) = argv[j] (VReg 0 = receiver); stack iff j >= 6.
+        // Static: VReg(j) = argv[j-1] (VReg 0 = padding); stack iff j >= 7.
         let mut arg_i = 0usize;
         if f.receiver != rubyc::native::ir::ReceiverKind::None {
             self.put(ARG[arg_i], alloc.loc[0]);
@@ -648,11 +666,32 @@ impl<'p> Emitter<'p> {
         }
         for p in 0..f.arity {
             // Params live at vregs 1..=arity (vreg 0 is the receiver).
-            // Clamp to available locations to avoid out-of-bounds on
-            // functions with more params than the allocator tracked.
-            let idx = (p + 1).min(alloc.loc.len().saturating_sub(1));
-            let arg_idx = (arg_i + p).min(ARG.len().saturating_sub(1));
-            self.put(ARG[arg_idx], alloc.loc[idx]);
+            let idx = p + 1;
+            if idx >= alloc.loc.len() {
+                continue;
+            }
+            let stack_disp: Option<i32> = if f.receiver
+                != rubyc::native::ir::ReceiverKind::None
+            {
+                (idx >= 6).then(|| 16 + 8 * (idx as i32 - 6))
+            } else {
+                (idx >= 7).then(|| 16 + 8 * (idx as i32 - 7))
+            };
+            if let Some(d) = stack_disp {
+                // mov rax, [rbp+d]; put rax → home.
+                self.bytes(&[0x48, 0x8B]);
+                if d <= 127 {
+                    self.code.push(modrm(0b01, RAX, 0b101));
+                    self.code.push(d as u8);
+                } else {
+                    self.code.push(modrm(0b10, RAX, 0b101));
+                    self.imm32(d);
+                }
+                self.put(RAX, alloc.loc[idx]);
+            } else {
+                let arg_idx = arg_i + p;
+                self.put(ARG[arg_idx], alloc.loc[idx]);
+            }
         }
 
         // Blocks emit in layout order; branch targets patch after the
@@ -1014,10 +1053,11 @@ impl<'p> Emitter<'p> {
             }
             Instr::BuildArgv { dst } => {
                 // Process argv → `string[]` (array layout mirrors
-                // `NewArray`: length at 0, elements from 8; strings in
-                // literal layout). Reads the kernel stack through the
-                // startup-saved slot; a zero slot (JIT) or wild argc
-                // yields an empty/truncated array, never a fault.
+                // `NewArray`: length at 0, refcount at 8, elements from
+                // 16; strings in literal layout). Reads the kernel
+                // stack through the startup-saved slot; a zero slot
+                // (JIT) or wild argc yields an empty/truncated array,
+                // never a fault.
                 // Scratch: rax, rcx, rdx, rsi, rdi, r8, r9, r11.
                 // rbx, rbp, r12-r15 are never touched. Stack is
                 // balanced (save + restore around the sequence); alloc
@@ -1038,9 +1078,17 @@ impl<'p> Emitter<'p> {
                 let jbe_argc = self.code.len();
                 self.bytes(&[0x76, 0x00]); // jbe argc_ok
                 self.bytes(&[0x48, 0x89, 0xC1]); // mov rcx, rax (truncate)
+                // .NET strips argv[0] (program path): length counts user
+                // args only (argc-1, floored at 0 — a bare kernel can
+                // pass argc=0). The element load below compensates with
+                // the same +1 (see the +16 displacement there).
+                self.bytes(&[0x48, 0x83, 0xE9, 0x01]); // sub rcx, 1
+                self.bytes(&[0x73, 0x02]); // jnb len_ok
+                self.bytes(&[0x31, 0xC9]); // xor ecx, ecx (floor)
+                // len_ok:
                 let argc_ok = self.code.len();
                 self.code[jbe_argc + 1] = (argc_ok - (jbe_argc + 2)) as i8 as u8;
-                self.bytes(&[rex(true, false, false), 0x8D, 0x34, 0xCD, 0x08, 0x00, 0x00, 0x00]); // lea rsi, [rcx*8+8] (rsi is reg 6: REX.R clear)
+                self.bytes(&[rex(true, false, false), 0x8D, 0x34, 0xCD, 0x10, 0x00, 0x00, 0x00]); // lea rsi, [rcx*8+16] (rsi is reg 6: REX.R clear; 16-byte header like NewArray: length + refcount, elements from slot 2)
                 self.bytes(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8 (align call)
                 self.call_rel32(CallTarget::HelperAlloc);
                 self.bytes(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
@@ -1050,6 +1098,11 @@ impl<'p> Emitter<'p> {
                 // from the slot instead of trusting the stale register
                 // (shipped the stale version once: Length read 0).
                 self.bytes(&[rex(true, false, true), 0x8B, modrm(0, 1, 1)]); // mov rcx, [r9] (argc, reloaded)
+                // Same argv[0]-strip as above (the reload re-reads raw argc).
+                self.bytes(&[0x48, 0x83, 0xE9, 0x01]); // sub rcx, 1
+                self.bytes(&[0x73, 0x02]); // jnb len_ok2
+                self.bytes(&[0x31, 0xC9]); // xor ecx, ecx (floor)
+                // len_ok2:
                 // ModRM via helper: mod=00 (memory [rdi]), NOT mod=11
                 // (which would move rcx into rdi and lose the array —
                 // shipped that way once, faulted on the Length read).
@@ -1059,7 +1112,7 @@ impl<'p> Emitter<'p> {
                 let jge_done = self.code.len();
                 self.bytes(&[0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00]); // jge done
                 let per_arg = self.code.len();
-                self.bytes(&[0x4B, 0x8B, 0x74, 0xD9, 0x08]); // mov rsi, [r9+r11*8+8] (rsi is reg 6: REX.R clear; X/B set)
+                self.bytes(&[0x4B, 0x8B, 0x74, 0xD9, 0x10]); // mov rsi, [r9+r11*8+16] (rsi is reg 6: REX.R clear; X/B set; +16 skips argv[0] to match the stripped length)
                 self.bytes(&[0x49, 0x89, 0xF0]); // mov r8, rsi (rsi source: REX.R clear)
                 self.bytes(&[0x31, 0xD2]); // xor edx, edx (len = 0)
                 let strlen1 = self.code.len();
@@ -1074,9 +1127,20 @@ impl<'p> Emitter<'p> {
                 self.code[jz_s1 + 1] = (strlen1_done - (jz_s1 + 2)) as i8 as u8;
                 self.code[jmp_s1 + 1] = (strlen1 as i32 - (jmp_s1 + 2) as i32) as i8 as u8;
                 self.bytes(&[rex(true, false, false), 0x8D, 0x72, 0x10]); // lea rsi, [rdx+16] (rsi is reg 6: REX.R clear)
+                // Spill the loop-carried array base (rdi) and index
+                // (r11) across HelperAlloc: it clobbers both (rep
+                // stosb target + zeroing). Without the spill every
+                // string alloc redirected the base at the in-flight
+                // string (returned as the array — Length read heap
+                // garbage) and the index at it (wild element stores).
+                // Paired pushes keep 16-alignment at the call.
+                self.bytes(&[0x57]); // push rdi
+                self.bytes(&[0x41, 0x53]); // push r11
                 self.bytes(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
                 self.call_rel32(CallTarget::HelperAlloc);
                 self.bytes(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+                self.bytes(&[0x41, 0x5B]); // pop r11
+                self.bytes(&[0x5F]); // pop rdi
                 // strlen2 and the copy loop below both use `al` as
                 // scratch, which would clobber strobj's low byte in rax
                 // (shipped that way once: every element pointed 0-255
@@ -1115,7 +1179,7 @@ impl<'p> Emitter<'p> {
                 self.code[jz_copy + 1] = (copy_done - (jz_copy + 2)) as i8 as u8;
                 self.code[jl_copy + 1] = (copy_head as i32 - (jl_copy + 2) as i32) as i8 as u8;
                 self.bytes(&[0x58]); // pop rax (restore strobj)
-                self.bytes(&[0x4A, 0x89, 0x44, 0xDF, 0x08]); // mov [rdi+r11*8+8], rax (rdi base is reg 7: REX.B clear; X set)
+                self.bytes(&[0x4A, 0x89, 0x44, 0xDF, 0x10]); // mov [rdi+r11*8+16], rax (rdi base is reg 7: REX.B clear; X set; +16 like NewArray, never the +8 refcount slot)
                 self.bytes(&[0x49, 0xFF, 0xC3]); // inc r11
                 self.bytes(&[rex(true, true, false), 0x3B, modrm(0, 3, 7)]); // cmp r11, [rdi]: opcode 0x3B (r64, r/m64) so jge skips when i >= length; 0x39 would compare backwards and skip whenever length > 0
                 let jl_per = self.code.len();
@@ -1190,11 +1254,17 @@ impl<'p> Emitter<'p> {
                 self.call_rel32(CallTarget::HelperRetain);
             }
             Instr::Release { src, bytes } => {
-                self.uses_release = true;
-                self.get(RAX, alloc.loc[src.0 as usize]);
-                self.bytes(&[0xBE]); // mov esi, imm32 (capacity)
-                self.imm32(*bytes as i32);
-                self.call_rel32(CallTarget::HelperRelease);
+                // TEMP-NORELEASE (diagnostic): skip release emission
+                // (bump-only heap, no freelist reuse, no premature
+                // free) to bisect heap-corruption crashes. Leaks.
+                // Removed before close.
+                if std::env::var("RUBYC_NORELEASE").is_err() {
+                    self.uses_release = true;
+                    self.get(RAX, alloc.loc[src.0 as usize]);
+                    self.bytes(&[0xBE]); // mov esi, imm32 (capacity)
+                    self.imm32(*bytes as i32);
+                    self.call_rel32(CallTarget::HelperRelease);
+                }
             }
             Instr::Exit => unreachable!("Exit is a terminator"),
             // v2 instructions not yet supported by the x86_64 backend.
@@ -1249,6 +1319,26 @@ impl<'p> Emitter<'p> {
                 self.bytes(&[0x48, 0xB9]); // movabs rcx, 0x8000000000000000
                 self.bytes(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80]);
                 self.bytes(&[0x48, 0x31, 0xC8]); // xor rax, rcx
+                self.put(RAX, alloc.loc[dst.0 as usize]);
+            }
+            Instr::F2I { dst, src } => {
+                // `cvttsd2si rax, xmm0`: truncate the scalar double to
+                // i64 (C# unchecked conversion semantics; out-of-range
+                // yields i64::MIN, matching CoreCLR).
+                self.get(RAX, alloc.loc[src.0 as usize]);
+                self.bytes(&[0x66, 0x48, 0x0F, 0x6E]);
+                self.code.push(modrm(0b11, 0, RAX)); // movq xmm0, rax
+                self.bytes(&[0xF2, 0x48, 0x0F, 0x2C]);
+                self.code.push(modrm(0b11, 0, RAX)); // cvttsd2si rax, xmm0
+                self.put(RAX, alloc.loc[dst.0 as usize]);
+            }
+            Instr::I2F { dst, src } => {
+                // `cvtsi2sd xmm0, rax`: i64 to scalar double (exact
+                // for |v| < 2**53, correctly rounded beyond).
+                self.get(RAX, alloc.loc[src.0 as usize]);
+                self.bytes(&[0xF2, 0x48, 0x0F, 0x2A]);
+                self.code.push(modrm(0b11, 0, RAX)); // cvtsi2sd xmm0, rax
+                self.store_fop(); // movq rax, xmm0 (bits back to vreg)
                 self.put(RAX, alloc.loc[dst.0 as usize]);
             }
             Instr::StackAlloc { .. } => unreachable!("StackAlloc not yet supported by x86_64"),
@@ -1318,12 +1408,31 @@ impl<'p> Emitter<'p> {
         let dl = alloc.loc[dst.0 as usize];
 
         if matches!(op, BinOp::Div | BinOp::Rem) {
-            // Hardware idiv semantics; zero divisor traps. Div takes the
-            // quotient (rax), Rem the remainder (rdx).
+            // Zero divisor yields zero instead of trapping with
+            // SIGFPE (C# would throw DivideByZeroException; static
+            // exes have no throwing runtime here, and
+            // not-yet-implemented paths — e.g. generic-math statics
+            // evaluating 0/0 during init — must produce a value, not
+            // abort the image). Div takes the quotient (rax), Rem the
+            // remainder (rdx).
             self.get(RAX, alloc.loc[a.0 as usize]);
             self.get(R11, alloc.loc[b.0 as usize]);
+            self.bytes(&[0x4D, 0x85, modrm(0b11, R11, R11)]); // test r11, r11
+            let jz_zero = self.code.len();
+            self.bytes(&[0x74, 0x00]); // jz div_zero
             self.bytes(&[0x48, 0x99]); // cqo
-            self.bytes(&[rex(true, false, true), 0xF7, modrm(0b11, 7, R11)]);
+            self.bytes(&[rex(true, false, true), 0xF7, modrm(0b11, 7, R11)]); // idiv r11
+            let jmp_done = self.code.len();
+            self.bytes(&[0xEB, 0x00]); // jmp div_done
+            let zero_at = self.code.len();
+            self.code[jz_zero + 1] = (zero_at - (jz_zero + 2)) as i8 as u8;
+            if op == BinOp::Rem {
+                self.bytes(&[0x31, 0xD2]); // xor edx, edx
+            } else {
+                self.bytes(&[0x31, 0xC0]); // xor eax, eax
+            }
+            let done_at = self.code.len();
+            self.code[jmp_done + 1] = (done_at - (jmp_done + 2)) as i8 as u8;
             if op == BinOp::Rem {
                 // Remainder rides in rdx; route it into the destination.
                 match dl {

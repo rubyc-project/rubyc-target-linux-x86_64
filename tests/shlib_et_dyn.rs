@@ -54,6 +54,7 @@ fn bare_mc() -> MachineCode {
         init_fn: None,
         relocs: vec![],
         heap_size: 0,
+        strip_symbols: false,
     }
 }
 

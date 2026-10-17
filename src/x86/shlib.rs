@@ -224,11 +224,39 @@ struct Shdr {
 
 /// Emit the shared object image.
 pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
+    write_shared_library_inner(mc, None)
+}
+
+/// Shared object with the library's type fragment embedded
+/// (`--embed-types`): the preamble kind becomes
+/// `SharedLibraryWithTypes`, followed by a u64 LE table length and the
+/// `.rci` bytes, then the payload. No section is emitted (the earlier
+/// `.rubyc_types`-section form stays readable as legacy fallback).
+/// `dlopen` never sees the table: the program headers skip from the
+/// ELF header straight past it.
+pub fn write_shared_library_embedded(
+    mc: &MachineCode,
+    types: &[u8],
+) -> Result<Vec<u8>, TargetError> {
+    write_shared_library_inner(mc, Some(types))
+}
+
+fn write_shared_library_inner(
+    mc: &MachineCode,
+    types: Option<&[u8]>,
+) -> Result<Vec<u8>, TargetError> {
     const EH: usize = 64;
     const PREAMBLE_AT: usize = 64;
-    const PHDR_AT: usize = 80; // after the 13-byte preamble, 16-aligned
+    // Program headers follow the preamble — plus the length-prefixed
+    // type table when embedding — 16-aligned.
+    let table_len = types.map(|t| t.len()).unwrap_or(0);
+    let phdr_at = if types.is_some() {
+        align(PREAMBLE_AT + 13 + 8 + table_len, 16)
+    } else {
+        80
+    };
     const PHNUM: usize = 5;
-    const CODE_BASE: usize = PHDR_AT + PHNUM * 56;
+    let code_base: usize = phdr_at + PHNUM * 56;
 
     // ---------- RX segment ----------
     // Trampolines (SysV entry stubs, one per export) follow the code blob.
@@ -244,7 +272,7 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
         })
         .collect();
     let tramps_total: usize = trampoline_sizes.iter().sum();
-    let tramp_base = CODE_BASE + mc.code.len();
+    let tramp_base = code_base + mc.code.len();
     let rx_end = tramp_base + tramps_total;
 
     // ---------- RW segment layout (sizes first so heap placement works) --
@@ -315,6 +343,7 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
 
     let mut export_values: Vec<u64> = Vec::with_capacity(mc.exports.len());
     let shoff = align(rw_end, 8);
+    // NULL + 7 named sections + shstrtab.
     let shstrtab_at = shoff + SHDR_COUNT * 64;
     // The file must physically contain both the RW segment and the tables.
     let image_len = shstrtab_at + shstrtab.len().max(PAGE - (rw_end % PAGE));
@@ -331,19 +360,27 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
     put_u16(&mut img, 18, 62); // EM_X86_64
     put_u32(&mut img, 20, 1); // e_version
     put_u64(&mut img, 24, 0); // e_entry — none
-    put_u64(&mut img, 32, PHDR_AT as u64); // e_phoff
+    put_u64(&mut img, 32, phdr_at as u64); // e_phoff
     put_u16(&mut img, 52, EH as u16); // e_ehsize
     put_u16(&mut img, 54, 56); // e_phentsize
     put_u16(&mut img, 56, PHNUM as u16);
     put_u16(&mut img, 58, 64); // e_shentsize
-    put_u16(&mut img, 60, SHDR_COUNT as u16);
+    put_u16(&mut img, 60, SHDR_COUNT as u16); // e_shnum
 
     // ---------- 🐕🇨 container preamble ----------
     img[PREAMBLE_AT..PREAMBLE_AT + 2].copy_from_slice(&container::JUMP_OVER_MAGIC);
     img[PREAMBLE_AT + 2..PREAMBLE_AT + 10].copy_from_slice(&container::MAGIC);
-    img[PREAMBLE_AT + 10] = Kind::SharedLibrary.to_byte();
+    img[PREAMBLE_AT + 10] = if types.is_some() {
+        Kind::SharedLibraryWithTypes.to_byte()
+    } else {
+        Kind::SharedLibrary.to_byte()
+    };
     let version_bytes = rubyc::bytecode::format::FORMAT_VERSION.to_le_bytes();
     img[PREAMBLE_AT + 11..PREAMBLE_AT + 13].copy_from_slice(&version_bytes);
+    if let Some(t) = types {
+        img[PREAMBLE_AT + 13..PREAMBLE_AT + 21].copy_from_slice(&(t.len() as u64).to_le_bytes());
+        img[PREAMBLE_AT + 21..PREAMBLE_AT + 21 + t.len()].copy_from_slice(t);
+    }
 
     // ---------- program headers ----------
     let phdrs = [
@@ -391,7 +428,7 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
         },
     ];
     for (i, p) in phdrs.iter().enumerate() {
-        let at = PHDR_AT + i * 56;
+        let at = phdr_at + i * 56;
         put_u32(&mut img, at, p.p_type);
         put_u32(&mut img, at + 4, p.flags);
         put_u64(&mut img, at + 8, p.offset);
@@ -403,7 +440,7 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
     }
 
     // ---------- code ----------
-    img[CODE_BASE..CODE_BASE + mc.code.len()].copy_from_slice(&mc.code);
+    img[code_base..code_base + mc.code.len()].copy_from_slice(&mc.code);
 
     // ---------- export entry trampolines ----------
     // Receiver-taking entries get a register-shifting trampoline;
@@ -414,7 +451,7 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
     let mut tramp_at = tramp_base;
     for (i, (name, fn_index, arity)) in mc.exports.iter().enumerate() {
         let size = trampoline_size(*arity, takes_recv(i));
-        let body_vaddr = (CODE_BASE + mc.fn_bases[*fn_index]) as u64;
+        let body_vaddr = (code_base + mc.fn_bases[*fn_index]) as u64;
         let code = build_trampoline(*arity, tramp_at as u64, body_vaddr, takes_recv(i));
         img[tramp_at..tramp_at + code.len()].copy_from_slice(&code);
         export_values.push(if takes_recv(i) { tramp_at as u64 } else { body_vaddr });
@@ -446,8 +483,8 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
                 .import_bases
                 .get(*i)
                 .filter(|b| **b != usize::MAX)
-                .map(|b| (CODE_BASE + b) as u64),
-            (Sym::Fn(i), Section::Data) => Some((CODE_BASE + mc.fn_bases[*i]) as u64),
+                .map(|b| (code_base + b) as u64),
+            (Sym::Fn(i), Section::Data) => Some((code_base + mc.fn_bases[*i]) as u64),
             _ => None,
         }
     };
@@ -473,7 +510,7 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
             Sym::ExcState(_) => 8,                                // r8
             _ => 0,                                               // rax (imports)
         };
-        encode_got_load(&mut img, CODE_BASE, r.site, reg_dst, got_slot as u64);
+        encode_got_load(&mut img, code_base, r.site, reg_dst, got_slot as u64);
         got_slot += 8;
     }
     for r in &mc.relocs {
@@ -505,7 +542,7 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
         let entry_vaddr = export_values
             .get(i)
             .copied()
-            .unwrap_or_else(|| (CODE_BASE + mc.fn_bases[*fn_index]) as u64);
+            .unwrap_or_else(|| (code_base + mc.fn_bases[*fn_index]) as u64);
         symtab[at + 8..at + 16].copy_from_slice(&entry_vaddr.to_le_bytes());
         // st_size stays 0: dlsym does not need it.
     }
@@ -568,7 +605,7 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
     let init_vaddr = mc
         .init_fn
         .and_then(|i| mc.fn_bases.get(i))
-        .map(|b| (CODE_BASE + b) as u64)
+        .map(|b| (code_base + b) as u64)
         .unwrap_or(0);
     let entries: [(u64, u64); 11] = [
         (DT_HASH, hash_start as u64),
@@ -591,8 +628,7 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
     img[dynamic_start..dynamic_start + dynamic.len()].copy_from_slice(&dynamic);
 
     // ---------- section headers ----------
-    let shstrtab_at = shoff + SHDR_COUNT * 64;
-    let sections = [
+    let mut sections = vec![
         Shdr {
             sh_type: SHT_NULL,
             flags: 0,
@@ -605,8 +641,8 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
         Shdr {
             sh_type: SHT_PROGBITS,
             flags: 6, // SHF_ALLOC | SHF_EXECINSTR
-            addr: CODE_BASE as u64,
-            offset: CODE_BASE as u64,
+            addr: code_base as u64,
+            offset: code_base as u64,
             size: mc.code.len() as u64,
             link: 0,
             entsize: 0,
@@ -665,16 +701,16 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
             link: 5, // .dynstr
             entsize: 16,
         },
-        Shdr {
-            sh_type: SHT_STRTAB,
-            flags: 0,
-            addr: 0,
-            offset: shstrtab_at as u64,
-            size: shstrtab.len() as u64,
-            link: 0,
-            entsize: 0,
-        },
     ];
+    sections.push(Shdr {
+        sh_type: SHT_STRTAB,
+        flags: 0,
+        addr: 0,
+        offset: shstrtab_at as u64,
+        size: shstrtab.len() as u64,
+        link: 0,
+        entsize: 0,
+    });
     for (i, s) in sections.iter().enumerate() {
         let at = shoff + i * 64;
         let name_off = match i {
@@ -698,6 +734,7 @@ pub fn write_shared_library(mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
     // Patch remaining ELF header fields now that offsets are final.
     put_u64(&mut img, 40, shoff as u64); // e_shoff
     put_u32(&mut img, 48, 0); // e_flags
+    put_u16(&mut img, 60, SHDR_COUNT as u16); // e_shnum
     put_u16(&mut img, 62, 8); // e_shstrndx -> .shstrtab
 
     Ok(img)

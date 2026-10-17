@@ -70,6 +70,7 @@ fn uses_and_defs(instr: &Instr) -> (Option<u32>, Vec<u32>) {
         Instr::Cmp { dst, a, b, .. } => (Some(dst.0), vec![a.0, b.0]),
         Instr::FBin { dst, a, b, .. } => (Some(dst.0), vec![a.0, b.0]),
         Instr::FCmp { dst, a, b, .. } => (Some(dst.0), vec![a.0, b.0]),
+        Instr::F2I { dst, src } | Instr::I2F { dst, src } => (Some(dst.0), vec![src.0]),
         Instr::CallByName {
             dst,
             recv,
@@ -182,6 +183,19 @@ pub fn allocate(f: &IrFunction) -> Allocation {
             }
             succs[bi] = vec![*if_true as usize, *if_false as usize];
         } else {
+            // Return/exit values are uses too: omitting them ends the
+            // returned vreg's live range early and lets the allocator
+            // hand its home to another value mid-block (a switch arm
+            // built its string, reused the home for the copy count,
+            // and returned the count instead of the string).
+            match &b.term {
+                Terminator::Ret(Some(v)) | Terminator::ExitWith(v) => {
+                    if !kill[bi].contains(&v.0) {
+                        upward_uses[bi].insert(v.0);
+                    }
+                }
+                _ => {}
+            }
             succs[bi] = vec![]; // Ret / Exit
         }
     }
@@ -249,6 +263,16 @@ pub fn allocate(f: &IrFunction) -> Allocation {
         }
         if let Terminator::Branch { cond: Some(c), .. } = &b.term {
             touch(c.0, position, &mut ranges);
+        }
+        // Return/exit values are live at the terminator (see the
+        // upward-uses fix above); without this touch a value returned
+        // at block end does not extend past its last instruction use
+        // and its home is reused mid-block.
+        match &b.term {
+            Terminator::Ret(Some(v)) | Terminator::ExitWith(v) => {
+                touch(v.0, position, &mut ranges);
+            }
+            _ => {}
         }
     }
     for v in 0..f.vregs {

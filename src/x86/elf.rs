@@ -45,33 +45,39 @@ impl ImageWriter for Writer {
 
         let data_file_off = align_up((code_off + rx_len) as u64, PAGE);
 
-        // Build symbol table (always emitted; gives `nm`/`readelf` visibility).
+        // Build symbol table (gives `nm`/`readelf` visibility); skipped
+        // entirely under `--strip` (`mc.strip_symbols`).
+        let strip = mc.strip_symbols;
         let mut strtab: Vec<u8> = vec![0u8]; // index 0 = NUL
         let mut symbols: Vec<[u64; 4]> = Vec::new(); // [name_off, info, other, shndx]
-        // Index 0: null symbol
-        symbols.push([0, 0, 0, 0]);
-        // Index 1: _start at code_vaddr (text section = 1)
-        let _start_off = add_string(&mut strtab, "_start");
-        symbols.push([_start_off, sym_info(2, 0), 0, 1]); // STT_FUNC, STB_LOCAL, shndx=1
-        // Function symbols
-        for (i, _base) in mc.fn_bases.iter().enumerate() {
-            let name = if i == 0 { "main".to_string() } else { format!("fn_{i}") };
-            let off = add_string(&mut strtab, &name);
-            symbols.push([off, sym_info(2, 0), 0, 1]); // STT_FUNC, shndx=1 (text)
+        if !strip {
+            // Index 0: null symbol
+            symbols.push([0, 0, 0, 0]);
+            // Index 1: _start at code_vaddr (text section = 1)
+            let _start_off = add_string(&mut strtab, "_start");
+            symbols.push([_start_off, sym_info(2, 0), 0, 1]); // STT_FUNC, STB_LOCAL, shndx=1
+            // Function symbols
+            for (i, _base) in mc.fn_bases.iter().enumerate() {
+                let name = if i == 0 { "main".to_string() } else { format!("fn_{i}") };
+                let off = add_string(&mut strtab, &name);
+                symbols.push([off, sym_info(2, 0), 0, 1]); // STT_FUNC, shndx=1 (text)
+            }
+            // Heap base symbol
+            let heap_off = add_string(&mut strtab, "__heap_base");
+            symbols.push([heap_off, sym_info(1, 3), 0, 3]); // STT_OBJECT, STB_COMMON, shndx=3 (BSS)
         }
-        // Heap base symbol
-        let heap_off = add_string(&mut strtab, "__heap_base");
-        symbols.push([heap_off, sym_info(1, 3), 0, 3]); // STT_OBJECT, STB_COMMON, shndx=3 (BSS)
 
         let symtab_off = align_up(data_file_off + mc.data.len() as u64, 8);
-        let symtab_len = (symbols.len() * 24) as u64;
+        let symtab_len = if strip { 0 } else { (symbols.len() * 24) as u64 };
         let strtab_off = align_up(symtab_off + symtab_len, 8);
-        let strtab_len = strtab.len() as u64;
-        // shstrtab: section name strings (inlined, NUL-terminated)
+        let strtab_len = if strip { 0 } else { strtab.len() as u64 };
+        // shstrtab: section name strings (inlined, NUL-terminated).
+        // Stripped images omit sections 4,5 (.symtab/.strtab) but keep
+        // the name table stable so .text/.data/.bss offsets never move.
         let shstrtab: &[u8] = b"\0.text\0.data\0.bss\0.symtab\0.strtab";
         let shstrtab_off = align_up(strtab_off + strtab_len, 8);
         let shstrtab_len = shstrtab.len() as u64;
-        let shnum = 6u16; // 0=null, 1=text, 2=data, 3=bss, 4=symtab, 5=strtab
+        let shnum = if strip { 4u16 } else { 6u16 }; // 0=null, 1=text, 2=data, 3=bss [, 4=symtab, 5=strtab]
         let shoff = align_up(shstrtab_off + shstrtab_len, 8);
         let total_len = (shoff + (shnum as u64) * (SH as u64)) as usize;
 
@@ -259,20 +265,23 @@ impl ImageWriter for Writer {
 
         img[58..60].copy_from_slice(&(shnum as u16).to_le_bytes()); // shnum
 
-        // Write symtab entries (Elf64_Sym: 24 bytes each)
-        let symtab_start = symtab_off as usize;
-        for (i, [name_off, info, other, shndx]) in symbols.iter().enumerate() {
-            let at = symtab_start + i * 24;
-            let mut entry = [0u8; 24];
-            entry[0..8].copy_from_slice(&name_off.to_le_bytes());
-            entry[8] = *info as u8;
-            entry[9] = *other as u8;
-            entry[10..12].copy_from_slice(&(*shndx as u16).to_le_bytes());
-            img[at..at + 24].copy_from_slice(&entry);
-        }
+        // Write symtab entries (Elf64_Sym: 24 bytes each); skipped when
+        // stripped (symbols/strtab are empty and the sections are absent).
+        if !strip {
+            let symtab_start = symtab_off as usize;
+            for (i, [name_off, info, other, shndx]) in symbols.iter().enumerate() {
+                let at = symtab_start + i * 24;
+                let mut entry = [0u8; 24];
+                entry[0..8].copy_from_slice(&name_off.to_le_bytes());
+                entry[8] = *info as u8;
+                entry[9] = *other as u8;
+                entry[10..12].copy_from_slice(&(*shndx as u16).to_le_bytes());
+                img[at..at + 24].copy_from_slice(&entry);
+            }
 
-        // Write strtab
-        img[strtab_off as usize..(strtab_off + strtab_len) as usize].copy_from_slice(&strtab);
+            // Write strtab
+            img[strtab_off as usize..(strtab_off + strtab_len) as usize].copy_from_slice(&strtab);
+        }
 
         // Write shstrtab
         img[shstrtab_off as usize..(shstrtab_off + shstrtab_len) as usize].copy_from_slice(shstrtab);
@@ -287,16 +296,26 @@ impl ImageWriter for Writer {
         write_sh(&mut img, sh_base + 2 * SH, 6, 1, data_vaddr, data_file_off, mc.data.len() as u64, 6, 0, 0, 0, 8, 0);
         // 3: .bss — type=8(NOBITS), flags=6(RW), link=0, info=0
         write_sh(&mut img, sh_base + 3 * SH, 11, 8, heap_vaddr, 0, heap_size_pages(mc.heap_size), 6, 0, 0, 0, 8, 0);
-        // 4: .symtab — type=2(SYMTAB), link=5(strtab), info=1 (first non-local)
-        write_sh(&mut img, sh_base + 4 * SH, 15, 2, 0, symtab_off, symtab_len, 5, 1, 0, 24, 0, 0);
-        // 5: .strtab — type=3(STRTAB)
-        write_sh(&mut img, sh_base + 5 * SH, 22, 3, 0, strtab_off, strtab_len, 0, 0, 0, 0, 0, 0);
+        if !strip {
+            // 4: .symtab — type=2(SYMTAB), link=5(strtab), info=1 (first non-local)
+            write_sh(&mut img, sh_base + 4 * SH, 15, 2, 0, symtab_off, symtab_len, 5, 1, 0, 24, 0, 0);
+            // 5: .strtab — type=3(STRTAB)
+            write_sh(&mut img, sh_base + 5 * SH, 22, 3, 0, strtab_off, strtab_len, 0, 0, 0, 0, 0, 0);
+        }
 
         Ok(img)
     }
 
     fn write_shared_library(&self, mc: &MachineCode) -> Result<Vec<u8>, TargetError> {
         super::shlib::write_shared_library(mc)
+    }
+
+    fn write_shared_library_embedded(
+        &self,
+        mc: &MachineCode,
+        types: &[u8],
+    ) -> Result<Vec<u8>, TargetError> {
+        super::shlib::write_shared_library_embedded(mc, types)
     }
 }
 

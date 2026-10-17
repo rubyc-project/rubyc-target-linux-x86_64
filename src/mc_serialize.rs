@@ -289,6 +289,10 @@ pub fn encode(mc: &MachineCode) -> Vec<u8> {
     // hand-rolled here (u32::MAX = none).
     v.extend_from_slice(&mc.init_fn.map(|i| i as u32).unwrap_or(u32::MAX).to_le_bytes());
 
+    // strip_symbols (trailing section): one byte; older buffers simply
+    // end before it and decode as false.
+    v.push(u8::from(mc.strip_symbols));
+
     v
 }
 
@@ -479,6 +483,12 @@ pub fn decode(bytes: &[u8]) -> Result<MachineCode, String> {
         }
     }
 
+    // strip_symbols (trailing section; absent in older buffers).
+    let mut strip_symbols = false;
+    if !r.is_empty() {
+        strip_symbols = r.byte()? != 0;
+    }
+
     Ok(MachineCode {
         code,
         data,
@@ -511,5 +521,6 @@ pub fn decode(bytes: &[u8]) -> Result<MachineCode, String> {
         init_fn,
         relocs,
         heap_size,
+        strip_symbols,
     })
 }

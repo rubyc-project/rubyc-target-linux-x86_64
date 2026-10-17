@@ -55,6 +55,7 @@ fn bare_mc() -> MachineCode {
         init_fn: None,
         relocs: vec![],
         heap_size: 0,
+        strip_symbols: false,
     }
 }
 
@@ -251,4 +252,24 @@ fn import_reloc_panics_when_unlinked() {
         Writer.write_image(&mc, false)
     }));
     assert!(result.is_err(), "unlinked import must panic");
+}
+
+#[test]
+fn strip_drops_symtab_sections_and_shrinks_image() {
+    let full = Writer.write_image(&bare_mc(), false).unwrap();
+    let mut mc = bare_mc();
+    mc.strip_symbols = true;
+    let stripped = Writer.write_image(&mc, false).unwrap();
+    assert_eq!(read_u16(&stripped, 58), 4, "e_shnum drops .symtab/.strtab");
+    assert_eq!(read_u16(&full, 58), 6, "control still has 6 sections");
+    assert!(
+        stripped.len() < full.len(),
+        "stripped image smaller: {} vs {}",
+        stripped.len(),
+        full.len()
+    );
+    // Entry, class, and machine still intact in the stripped image.
+    assert_eq!(&stripped[0..4], b"\x7fELF");
+    assert_eq!(read_u16(&stripped, 16), 2, "ET_EXEC");
+    assert_eq!(read_u64(&stripped, 24), BASE + CODE_OFF as u64, "e_entry kept");
 }

@@ -615,3 +615,84 @@ fn enc_build_argv_rex_bytes() {
         assert!(!has_seq(&mc.code, bad), "stale mis-encoded {bad:02x?} must be gone");
     }
 }
+
+#[test]
+fn enc_build_argv_array_layout_matches_newarray() {
+    // The argv array must mirror `NewArray` layout ([0]=length,
+    // [8]=refcount, elements from +16): the old element store went
+    // to +8+i*8 (overlapping the refcount slot and shifting every
+    // element read by one) and sized the alloc N*8+8 (8 short).
+    let mut f = IrFunction::new("@start", ReceiverKind::None, 0);
+    let argv = f.fresh_vreg();
+    f.push(Instr::BuildArgv { dst: argv });
+    f.blocks[0].term = Terminator::Ret(Some(argv));
+    let mc = run_ir(make_program(f));
+    // lea rsi,[rcx*8+16]: room for the 16-byte header.
+    assert!(
+        has_seq(&mc.code, &[0x48, 0x8D, 0x34, 0xCD, 0x10, 0x00, 0x00, 0x00]),
+        "argv array alloc must leave the 16-byte header"
+    );
+    assert!(
+        !has_seq(&mc.code, &[0x48, 0x8D, 0x34, 0xCD, 0x08, 0x00, 0x00, 0x00]),
+        "short argv alloc must be gone"
+    );
+    // mov [rdi+r11*8+16],rax: elements from slot 2 like NewArray.
+    assert!(
+        has_seq(&mc.code, &[0x4A, 0x89, 0x44, 0xDF, 0x10]),
+        "argv elements must start at +16"
+    );
+    assert!(
+        !has_seq(&mc.code, &[0x4A, 0x89, 0x44, 0xDF, 0x08]),
+        "refcount-overlapping element store must be gone"
+    );
+}
+
+#[test]
+fn enc_build_argv_spills_across_alloc() {
+    // HelperAlloc clobbers rdi/r11 (rep-stosb target + zeroing), but
+    // the per-arg loop carries the array base in rdi and the index
+    // in r11 across the string alloc: without spills every string
+    // alloc redirected the base at the in-flight string (returned as
+    // the array — Length read heap garbage) and the index at it
+    // (wild element stores). Paired push/pop around the call.
+    let mut f = IrFunction::new("@start", ReceiverKind::None, 0);
+    let argv = f.fresh_vreg();
+    f.push(Instr::BuildArgv { dst: argv });
+    f.blocks[0].term = Terminator::Ret(Some(argv));
+    let mc = run_ir(make_program(f));
+    assert!(
+        has_seq(&mc.code, &[0x57, 0x41, 0x53]),
+        "push rdi + push r11 must precede the string alloc"
+    );
+    assert!(
+        has_seq(&mc.code, &[0x41, 0x5B, 0x5F]),
+        "pop r11 + pop rdi must follow the string alloc"
+    );
+}
+
+#[test]
+fn enc_build_argv_strips_program_name() {
+    // Real .NET `Main(string[])` sees user args only: argv[0]
+    // (program path) is skipped, length = argc-1 floored at 0.
+    // (Shipping argv[0] shifted every consumer by one.)
+    let mut f = IrFunction::new("@start", ReceiverKind::None, 0);
+    let argv = f.fresh_vreg();
+    f.push(Instr::BuildArgv { dst: argv });
+    f.blocks[0].term = Terminator::Ret(Some(argv));
+    let mc = run_ir(make_program(f));
+    // sub rcx,1 + jnb + xor ecx,ecx: the strip (twice: alloc-size
+    // and length-store paths).
+    assert!(
+        has_seq(&mc.code, &[0x48, 0x83, 0xE9, 0x01]),
+        "argv length must subtract the program name"
+    );
+    // mov rsi,[r9+r11*8+16]: element load skips argv[0] too.
+    assert!(
+        has_seq(&mc.code, &[0x4B, 0x8B, 0x74, 0xD9, 0x10]),
+        "argv elements must start at argv[1]"
+    );
+    assert!(
+        !has_seq(&mc.code, &[0x4B, 0x8B, 0x74, 0xD9, 0x08]),
+        "program-name element load must be gone"
+    );
+}

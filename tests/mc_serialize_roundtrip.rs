@@ -37,6 +37,7 @@ fn empty_mc() -> MachineCode {
         init_fn: None,
         relocs: vec![],
         heap_size: 0,
+        strip_symbols: false,
     }
 }
 
@@ -87,6 +88,7 @@ fn full_mc() -> MachineCode {
             Reloc { kind: RelocKind::Abs64, section: Section::Code, site: 52, sym: Sym::Name(7) },
         ],
         heap_size: 4096,
+        strip_symbols: true,
     }
 }
 
@@ -156,6 +158,7 @@ fn full_machine_code_roundtrips_all_fields() {
     assert_eq!(back.relocs[10].sym, Sym::Import(1));
     assert_eq!(back.relocs[11].sym, Sym::Name(7));
     assert_eq!(back.heap_size, 4096);
+    assert_eq!(back.strip_symbols, true);
 }
 
 #[test]
