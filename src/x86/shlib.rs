@@ -29,6 +29,7 @@ const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 /// `R_X86_64_RELATIVE`.
 const R_RELATIVE: u64 = 8;
+const R_GLOB_DAT: u64 = 6;
 
 const DT_NULL: u64 = 0;
 const DT_HASH: u64 = 4;
@@ -39,8 +40,8 @@ const DT_RELASZ: u64 = 8;
 const DT_RELAENT: u64 = 9;
 const DT_STRSZ: u64 = 10;
 const DT_SYMENT: u64 = 11;
-const DT_RELACOUNT: u64 = 19;
 const DT_INIT: u64 = 12;
+const DT_NEEDED: u64 = 1;
 
 const SHT_NULL: u32 = 0;
 const SHT_PROGBITS: u32 = 1;
@@ -264,7 +265,14 @@ fn write_shared_library_inner(
         .exports
         .iter()
         .enumerate()
-        .map(|(i, (_, _, arity))| {
+        .map(|(i, (name, _, arity))| {
+            // Qualified exports (`<path>::<method>#<arity>`) are the
+            // cross-image names: a RubyC caller already passes the
+            // receiver in rdi, so the body is the right target. Bare
+            // exports keep the SysV trampoline for C hosts.
+            if name.contains("::") {
+                return 0;
+            }
             trampoline_size(
                 *arity,
                 mc.export_takes_receiver.get(i).copied().unwrap_or(true),
@@ -298,7 +306,30 @@ fn write_shared_library_inner(
         let off = mc.static_offsets.get(i).copied().unwrap_or(0);
         object_syms.push((sym.clone(), off));
     }
-    let nsyms = mc.exports.len() + object_syms.len() + 1; // leading null symbol
+    // Dependency-image imports (`.so` hints) stay undefined in the
+    // dynamic symbol table and are resolved by the loader through
+    // DT_NEEDED + R_X86_64_GLOB_DAT. This is the .NET model: the shared
+    // library is a runtime dependency, never copied bodies.
+    let mut dep_syms: Vec<(String, String)> = Vec::new(); // (entry, hint)
+    for (i, (hint, entry)) in mc.import_names.iter().enumerate() {
+        if !hint.ends_with(".so") {
+            continue;
+        }
+        if matches!(mc.import_bases.get(i).copied(), Some(b) if b != usize::MAX) {
+            continue;
+        }
+        if !dep_syms.iter().any(|(e, _)| e == entry) {
+            dep_syms.push((entry.clone(), hint.clone()));
+        }
+    }
+    let mut dep_hints: Vec<String> = Vec::new();
+    for (_, hint) in &dep_syms {
+        if !dep_hints.contains(hint) {
+            dep_hints.push(hint.clone());
+        }
+    }
+    let dep_sym_base = mc.exports.len() + object_syms.len() + 1;
+    let nsyms = dep_sym_base + dep_syms.len();
     let dynsym_size = nsyms * 24;
     let dynstr_size = 1 + mc
         .exports
@@ -308,10 +339,16 @@ fn write_shared_library_inner(
         + object_syms
             .iter()
             .map(|(n, _)| n.len() + 1)
-            .sum::<usize>();
+            .sum::<usize>()
+        + dep_syms.iter().map(|(n, _)| n.len() + 1).sum::<usize>()
+        + dep_hints.iter().map(|n| n.len() + 1).sum::<usize>();
     let nbucket = nsyms.max(1);
     let hash_size = (nbucket + nsyms + 2) * 4;
-    let dynamic_size = 11 * 16; // ten entries plus DT_NULL
+    // hash, strtab, symtab, strsz, syment, rela, relasz, relaent, init,
+    // NULL plus one DT_NEEDED per dependency image.
+    let dynamic_entries =
+        8 + usize::from(mc.init_fn.is_some()) + dep_hints.len() + 1;
+    let dynamic_size = dynamic_entries * 16;
 
     let dynsym_start = align(rela_start + nrela * 24, 8);
     let dynstr_start = align(dynsym_start + dynsym_size, 8);
@@ -342,6 +379,7 @@ fn write_shared_library_inner(
     shstrtab.extend_from_slice(b".shstrtab\0");
 
     let mut export_values: Vec<u64> = Vec::with_capacity(mc.exports.len());
+    let mut export_sizes: Vec<u64> = Vec::with_capacity(mc.exports.len());
     let shoff = align(rw_end, 8);
     // NULL + 7 named sections + shstrtab.
     let shstrtab_at = shoff + SHDR_COUNT * 64;
@@ -450,11 +488,32 @@ fn write_shared_library_inner(
     let takes_recv = |i: usize| mc.export_takes_receiver.get(i).copied().unwrap_or(true);
     let mut tramp_at = tramp_base;
     for (i, (name, fn_index, arity)) in mc.exports.iter().enumerate() {
-        let size = trampoline_size(*arity, takes_recv(i));
+        let size = trampoline_sizes[i];
         let body_vaddr = (code_base + mc.fn_bases[*fn_index]) as u64;
-        let code = build_trampoline(*arity, tramp_at as u64, body_vaddr, takes_recv(i));
+        // The linker copy-links a body only when the symbol carries a
+        // size; a receiver-taking export is the trampoline it points at,
+        // a static export is the body up to the next function (or the
+        // end of the code blob).
+        let body_size = {
+            let start = mc.fn_bases[*fn_index];
+            let end = mc
+                .fn_bases
+                .get(fn_index + 1)
+                .copied()
+                .unwrap_or(mc.code.len());
+            end.saturating_sub(start) as u64
+        };
+        if size == 0 {
+            // Qualified cross-image export: bind straight to the body.
+            export_values.push(body_vaddr);
+            export_sizes.push(body_size);
+            continue;
+        }
+        let takes = takes_recv(i);
+        let code = build_trampoline(*arity, tramp_at as u64, body_vaddr, takes);
         img[tramp_at..tramp_at + code.len()].copy_from_slice(&code);
-        export_values.push(if takes_recv(i) { tramp_at as u64 } else { body_vaddr });
+        export_values.push(if takes { tramp_at as u64 } else { body_vaddr });
+        export_sizes.push(if takes { size as u64 } else { body_size });
         let _ = name;
         tramp_at += size;
     }
@@ -491,8 +550,33 @@ fn write_shared_library_inner(
 
     let mut rela: Vec<u8> = Vec::with_capacity(nrela * 24);
     let mut got_slot = got_start;
+    let dep_sym_index = |i: usize| -> Option<usize> {
+        let (hint, entry) = mc.import_names.get(i)?;
+        if !hint.ends_with(".so") {
+            return None;
+        }
+        if matches!(mc.import_bases.get(i).copied(), Some(b) if b != usize::MAX) {
+            return None;
+        }
+        dep_syms.iter().position(|(e, _)| e == entry)
+    };
     for r in &mc.relocs {
         if !(r.kind == RelocKind::Abs64 && r.section == Section::Code) {
+            continue;
+        }
+        if let Sym::Import(i) = &r.sym
+            && let Some(pos) = dep_sym_index(*i)
+        {
+            // Runtime dependency: the slot starts zero and the loader
+            // writes the resolved address (GLOB_DAT), never the image.
+            push_u64(&mut rela, got_slot as u64);
+            push_u64(
+                &mut rela,
+                (((dep_sym_base + pos) as u64) << 32) | R_GLOB_DAT,
+            );
+            push_u64(&mut rela, 0);
+            encode_got_load(&mut img, code_base, r.site, 0, got_slot as u64);
+            got_slot += 8;
             continue;
         }
         let value = final_value(r).unwrap_or(0);
@@ -544,7 +628,11 @@ fn write_shared_library_inner(
             .copied()
             .unwrap_or_else(|| (code_base + mc.fn_bases[*fn_index]) as u64);
         symtab[at + 8..at + 16].copy_from_slice(&entry_vaddr.to_le_bytes());
-        // st_size stays 0: dlsym does not need it.
+        // Copy-linking extracts the body by st_size; a zero size made
+        // every import from a `.so` unreachable (`--lib lib.so` failed
+        // with "imports not found" although dlsym worked).
+        symtab[at + 16..at + 24]
+            .copy_from_slice(&export_sizes.get(i).copied().unwrap_or(0).to_le_bytes());
     }
     // Data-section OBJECT symbols follow the function exports: vtable
     // rows and static slots alike (see `object_syms`). Downstream images
@@ -562,7 +650,29 @@ fn write_shared_library_inner(
         symtab[at + 5] = 0; // STV_DEFAULT — required for dlsym visibility
         symtab[at + 6..at + 8].copy_from_slice(&2u16.to_le_bytes()); // st_shndx = .data
         symtab[at + 8..at + 16].copy_from_slice(&((data_at + off) as u64).to_le_bytes());
-        // st_size stays 0: dlsym does not need it.
+        // OBJECT imports (vtable rows, static slots) are address-only;
+        // one word is the symbol's extent and satisfies the linker's
+        // non-zero-size gate.
+        symtab[at + 16..at + 24].copy_from_slice(&8u64.to_le_bytes());
+    }
+    // Undefined dependency symbols: the loader resolves these against
+    // the DT_NEEDED images and fills the GOT slots (GLOB_DAT).
+    for (i, (entry, _)) in dep_syms.iter().enumerate() {
+        let name_off = strtab.len();
+        strtab.extend_from_slice(entry.as_bytes());
+        strtab.push(0);
+        let at = (dep_sym_base + i) * 24;
+        symtab[at..at + 4].copy_from_slice(&(name_off as u32).to_le_bytes()); // st_name
+        symtab[at + 4] = 0x10; // STB_GLOBAL << 4 | STT_NOTYPE
+        symtab[at + 5] = 0; // STV_DEFAULT
+        // st_shndx = SHN_UNDEF (0), st_value = 0, st_size = 0.
+    }
+    // DT_NEEDED string offsets, one per dependency image.
+    let mut needed_offsets: Vec<usize> = Vec::with_capacity(dep_hints.len());
+    for hint in &dep_hints {
+        needed_offsets.push(strtab.len());
+        strtab.extend_from_slice(hint.as_bytes());
+        strtab.push(0);
     }
     img[dynsym_start..dynsym_start + dynsym_size].copy_from_slice(&symtab);
 
@@ -607,7 +717,7 @@ fn write_shared_library_inner(
         .and_then(|i| mc.fn_bases.get(i))
         .map(|b| (code_base + b) as u64)
         .unwrap_or(0);
-    let entries: [(u64, u64); 11] = [
+    let mut entries: Vec<(u64, u64)> = vec![
         (DT_HASH, hash_start as u64),
         (DT_STRTAB, dynstr_start as u64),
         (DT_SYMTAB, dynsym_start as u64),
@@ -616,10 +726,19 @@ fn write_shared_library_inner(
         (DT_RELA, rela_start as u64),
         (DT_RELASZ, (nrela * 24) as u64),
         (DT_RELAENT, 24),
-        (DT_RELACOUNT, nrela as u64),
-        (DT_INIT, init_vaddr),
-        (DT_NULL, 0),
     ];
+    // DT_INIT must be omitted when there is no initializer: an INIT tag
+    // with value 0 makes the loader call the image BASE (it calls
+    // `l_addr + d_ptr` whenever the tag is present), which executed the
+    // ELF header and crashed every RubyC `.so` on dlopen.
+    if init_vaddr != 0 {
+        entries.push((DT_INIT, init_vaddr));
+    }
+    for off in &needed_offsets {
+        entries.push((DT_NEEDED, *off as u64));
+    }
+    entries.push((DT_NULL, 0));
+    debug_assert_eq!(entries.len(), dynamic_entries);
     let mut dynamic: Vec<u8> = Vec::with_capacity(dynamic_size);
     for (tag, val) in entries {
         push_u64(&mut dynamic, tag);

@@ -26,7 +26,7 @@ fn retain_release_are_recognizable_prologues() {
     // __rubyc_retain: test rax,rax then jz over the lock increment.
     assert_eq!(&RETAIN[..5], &[0x48, 0x85, 0xC0, 0x74, 0x05]);
     // __rubyc_release opens with the same null check.
-    assert_eq!(&RELEASE[..5], &[0x48, 0x85, 0xC0, 0x74, 0x1E]);
+    assert_eq!(&RELEASE[..5], &[0x48, 0x85, 0xC0, 0x74, 0x27]);
 }
 
 #[test]
@@ -44,15 +44,17 @@ fn alloc_revised_jumps() {
 
 #[test]
 fn release_jnz_skips_freelist_push() {
-    // lock dec … then jnz .skip with rel8 0x1e landing past the push seq
+    // lock dec, then mask the string tag bit (shl 1), then jnz .skip; both
+    // skip paths must land on a `ret`, not past the snippet.
     let i = RELEASE
         .windows(5)
         .position(|w| w == [0xF0, 0x48, 0xFF, 0x48, 0x08])
         .unwrap();
-    assert_eq!(RELEASE[i + 5], 0x75); // jnz
-    let rel = RELEASE[i + 6] as i8 as i64;
-    // Both skip paths must land on a `ret`, not past the snippet.
-    let target = ((i + 7) as i64 + rel) as usize;
+    assert_eq!(&RELEASE[i + 5..i + 9], &[0x48, 0x8B, 0x48, 0x08]); // mov rcx,[rax+8]
+    assert_eq!(&RELEASE[i + 9..i + 13], &[0x48, 0xC1, 0xE1, 0x02]); // shl rcx,2
+    assert_eq!(RELEASE[i + 13], 0x75); // jnz
+    let rel = RELEASE[i + 14] as i8 as i64;
+    let target = ((i + 15) as i64 + rel) as usize;
     assert_eq!(RELEASE[target], 0xC3);
     assert!(target < RELEASE.len());
 }

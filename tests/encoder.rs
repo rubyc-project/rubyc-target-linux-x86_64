@@ -577,14 +577,32 @@ fn enc_build_argv_rex_bytes() {
     // REX.X ⟺ SIB.index ≥ 8, REX.B ⟺ rm/base ≥ 8. rsi/rdi/rcx (6/7/1)
     // take no extension bits; r8/r9/r11 (8/9/11) take them.
     for good in [
-        &[0x48, 0x8D, 0x34, 0xCD][..], // lea rsi,[rcx*8+8], REX.R clear
-        &[0x4B, 0x8B, 0x74, 0xD9][..], // mov rsi,[r9+r11*8+8], R clear
+        &[0x48, 0x8D, 0x34, 0xCD][..], // lea rsi,[rcx*8+16], REX.R clear
+        &[0x4B, 0x8B, 0x74, 0xD9][..], // mov rsi,[r9+r11*8+16], R clear
         &[0x49, 0x89, 0xF0][..],       // mov r8,rsi, REX.R clear
-        &[0x48, 0x8D, 0x72, 0x10][..], // lea rsi,[rdx+16], REX.R clear
-        &[0x41, 0x8A, 0x34, 0x08][..], // mov sil,[r8+rcx]: sil, not al (al is rax's low byte and rax holds strobj live; a char load into al rewrites the pointer)
-        &[0x48, 0x88, 0xB4, 0x08][..], // mov [rax+rcx+16],sil, REX.X clear
-        &[0x4A, 0x89, 0x44, 0xDF][..], // mov [rdi+r11*8+8],rax, REX.B clear
+        // UTF-16 allocation: units = byte length * 2, header 16.
+        &[0x48, 0x89, 0xD6][..],       // mov rsi,rdx
+        &[0x48, 0xC1, 0xE6, 0x01][..], // shl rsi,1
+        &[0x48, 0x83, 0xC6, 0x10][..], // add rsi,16
+        // UTF-8 decoder: multi-byte reads and continuation validation.
+        &[0x41, 0x0F, 0xB6, 0x04, 0x08][..], // movzx eax,[r8+rcx] (lead byte)
+        &[0x45, 0x0F, 0xB6, 0x4C, 0x08, 0x01][..], // movzx r9d,[r8+rcx+1] (REX.RB)
+        &[0x41, 0x81, 0xFA, 0x80, 0x00, 0x00, 0x00][..], // cmp r10d,0x80
+        &[0x66, 0x89, 0x06][..],       // mov [rsi],ax (BMP unit)
+        &[0x66, 0x44, 0x89, 0x0E][..], // mov [rsi],r9w (high surrogate)
+        &[0x66, 0xC7, 0x06, 0xFD, 0xFF][..], // mov word [rsi],0xFFFD
+        &[0x41, 0x51][..],             // push r9 (kernel argv pointer)
+        &[0x41, 0x59][..],             // pop r9
+        &[0x4A, 0x89, 0x44, 0xDF][..], // mov [rdi+r11*8+16],rax, REX.B clear
         &[0x4C, 0x3B, 0x1F][..],       // cmp r11,[rdi], REX.B clear, CMP r64,r/m64
+        // JIT has no kernel stack: a zero slot is redirected to the slot
+        // itself, whose zero word is read as argc = 0.
+        &[0x4D, 0x85, 0xC9][..],       // test r9,r9
+        &[0x49, 0x89, 0xC1][..],       // mov r9,rax
+        // @start stores rsp only into an empty slot; a host-supplied slot
+        // (the JIT's argv block) must be kept.
+        &[0x48, 0x83, 0x38, 0x00][..], // cmp qword [rax],0
+        &[0x48, 0x89, 0x20][..],       // mov [rax],rsp
     ] {
         assert!(has_seq(&mc.code, good), "missing correct encoding {good:02x?}");
     }

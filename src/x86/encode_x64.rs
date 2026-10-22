@@ -537,6 +537,19 @@ impl<'p> Emitter<'p> {
         site
     }
 
+    /// Emit `op` plus a rel32 placeholder and record it for patching.
+    fn branch32(
+        &mut self,
+        op: &[u8],
+        fixups: &mut Vec<(usize, &'static str)>,
+        label: &'static str,
+    ) {
+        self.bytes(op);
+        let site = self.code.len();
+        self.bytes(&[0, 0, 0, 0]);
+        fixups.push((site, label));
+    }
+
     /// `write(fd, str_ptr, len)` inline syscall for a data-section string.
     fn write_str_syscall(&mut self, off: u32, len: u32, fd: u32) {
         self.bytes(&[0xBF]); // mov edi, fd
@@ -614,9 +627,17 @@ impl<'p> Emitter<'p> {
         // pushes anything. Only `rax` is touched (dead at entry), so no
         // register state is disturbed. Gated on argv use: paramless
         // programs keep byte-identical entry code.
+        //
+        // A host that is not a process entry (the JIT) pre-seeds the
+        // slot with its own argv block; non-zero means "already
+        // supplied" and the rsp stash is skipped. An empty slot (the
+        // ELF image's zeroed BSS) means read the kernel stack.
         if f.name == "@start" && self.uses_argv {
             self.abs64_window(0xB8, Sym::ArgvRsp); // movabs rax, slot
+            self.bytes(&[0x48, 0x83, 0x38, 0x00]); // cmp qword [rax], 0
+            self.bytes(&[0x75, 0x03]); // jne have_argv
             self.bytes(&[0x48, 0x89, 0x20]); // mov [rax], rsp
+            // have_argv:
         }
         self.bytes(&[0x55]); // push rbp
         self.bytes(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
@@ -1012,6 +1033,26 @@ impl<'p> Emitter<'p> {
                 self.abs64_window(0xB9, Sym::VtableOff(off)); // movabs rcx
                 self.put(RCX, alloc.loc[dst.0 as usize]);
             }
+            Instr::CallFnAddr { dst, target, args } => {
+                // Call through an address held in a register. The target
+                // is moved to r11 FIRST: `place_args` fills the argument
+                // registers, and a target vreg that happened to be
+                // allocated to one of them would be overwritten before the
+                // call. r11 is not an argument register in this ABI.
+                self.get(R11, alloc.loc[target.0 as usize]);
+                self.place_args(alloc, args);
+                self.bytes(&[0x41, 0xFF, 0xD3]); // call r11
+                self.cleanup_tail(args.len());
+                self.put(RAX, alloc.loc[dst.0 as usize]);
+            }
+            Instr::FnAddr { dst, fidx } => {
+                // `movabs rcx, <address of function fidx>`: the same
+                // window `LoadStaticAddr` uses, with a `Sym::Fn` reloc the
+                // linker resolves to the function's code address. A
+                // delegate object stores this so it can be called later.
+                self.abs64_window(0xB9, Sym::Fn(*fidx as usize));
+                self.put(RCX, alloc.loc[dst.0 as usize]);
+            }
             Instr::LoadStaticAddr { dst, idx } => {
                 let r = (*idx as usize).min(self.static_offsets.len().saturating_sub(1));
                 self.abs64_window(0xB9, Sym::Static(r)); // movabs rcx
@@ -1071,6 +1112,14 @@ impl<'p> Emitter<'p> {
                 // the [rax] base needs REX.B *clear* (0x4D here would
                 // silently redirect the read to [r8] — caught live).
                 self.bytes(&[rex(true, true, false), 0x8B, modrm(0, 1, 0)]); // mov r9, [rax]
+                // No startup stack (the JIT never writes the slot): point
+                // r9 at the slot itself, whose zero word is then read as
+                // `argc = 0`. Without this, the argc read dereferenced
+                // null and every `Main(string[] args)` faulted under `run`.
+                self.bytes(&[0x4D, 0x85, 0xC9]); // test r9, r9
+                self.bytes(&[0x75, 0x03]); // jnz have_stack
+                self.bytes(&[0x49, 0x89, 0xC1]); // mov r9, rax (slot address)
+                // have_stack:
                 // Same trap: r9 as a memory base needs REX.B.
                 self.bytes(&[rex(true, false, true), 0x8B, modrm(0, 1, 1)]); // mov rcx, [r9] (argc)
                 self.bytes(&[0x48, 0xC7, 0xC0, 0x00, 0x04, 0x00, 0x00]); // mov rax, 1024
@@ -1126,7 +1175,10 @@ impl<'p> Emitter<'p> {
                 let strlen1_done = self.code.len();
                 self.code[jz_s1 + 1] = (strlen1_done - (jz_s1 + 2)) as i8 as u8;
                 self.code[jmp_s1 + 1] = (strlen1 as i32 - (jmp_s1 + 2) as i32) as i8 as u8;
-                self.bytes(&[rex(true, false, false), 0x8D, 0x72, 0x10]); // lea rsi, [rdx+16] (rsi is reg 6: REX.R clear)
+                // UTF-16 data: 2 bytes per char + the 16-byte header.
+                self.bytes(&[0x48, 0x89, 0xD6]); // mov rsi, rdx
+                self.bytes(&[0x48, 0xC1, 0xE6, 0x01]); // shl rsi, 1
+                self.bytes(&[0x48, 0x83, 0xC6, 0x10]); // add rsi, 16
                 // Spill the loop-carried array base (rdi) and index
                 // (r11) across HelperAlloc: it clobbers both (rep
                 // stosb target + zeroing). Without the spill every
@@ -1141,12 +1193,23 @@ impl<'p> Emitter<'p> {
                 self.bytes(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
                 self.bytes(&[0x41, 0x5B]); // pop r11
                 self.bytes(&[0x5F]); // pop rdi
-                // strlen2 and the copy loop below both use `al` as
-                // scratch, which would clobber strobj's low byte in rax
-                // (shipped that way once: every element pointed 0-255
-                // bytes low). Save/restore around each clobber region;
-                // balanced pushes, no calls between, rsp parity intact.
-                self.bytes(&[0x50]); // push rax (save strobj)
+                // ---- UTF-8 -> UTF-16 -----------------------------------
+                // argv is NUL-terminated UTF-8. Widening each byte made
+                // "é" two characters (Ã©); decode the sequence instead and
+                // write one UTF-16 unit per code point (two for an astral
+                // pair). The 2*bytes+16 allocation above is an upper bound:
+                // a code unit never consumes less than one input byte.
+                //
+                // Scratch: rax (the object is on the stack), rcx byte
+                // index, rdx byte length, rsi destination, r8 source,
+                // r9/r10/r11 temps. r9 is the kernel argv pointer and r11
+                // the outer arg index, so both are pushed for the decode.
+                self.bytes(&[0x49, 0xBA]); // movabs r10, tagged refcount
+                self.imm64(0x8000_0000_0000_0001u64); // string tag (high bit) | count 1
+                self.bytes(&[0x4C, 0x89, 0x50, 0x08]); // mov [rax+8], r10 (REX.R for r10, B clear for rax)
+                self.bytes(&[0x41, 0x51]); // push r9 (kernel argv pointer)
+                self.bytes(&[0x41, 0x53]); // push r11 (outer arg index)
+                self.bytes(&[0x50]); // push rax (strobj; al is scratch below)
                 // strlen again: rdx died in alloc, r8 src survived.
                 self.bytes(&[0x31, 0xD2]); // xor edx, edx
                 let strlen2 = self.code.len();
@@ -1160,25 +1223,173 @@ impl<'p> Emitter<'p> {
                 let strlen2_done = self.code.len();
                 self.code[jz_s2 + 1] = (strlen2_done - (jz_s2 + 2)) as i8 as u8;
                 self.code[jmp_s2 + 1] = (strlen2 as i32 - (jmp_s2 + 2) as i32) as i8 as u8;
-                self.bytes(&[0x58]); // pop rax (restore strobj)
-                self.bytes(&[0x48, 0x89, 0x10]); // mov [rax], rdx (length)
-                self.bytes(&[0xC7, 0x40, 0x08, 0x01, 0x00, 0x00, 0x00]); // mov dword [rax+8], 1
-                self.bytes(&[0x50]); // push rax (save strobj; copy uses al; before the empty-string jz so push/pop always pair)
-                self.bytes(&[0x48, 0x85, 0xD2]); // test rdx, rdx
-                let jz_copy = self.code.len();
-                self.bytes(&[0x74, 0x00]); // jz copy_done (empty string)
-                self.bytes(&[0x31, 0xC9]); // xor ecx, ecx
-                let copy_head = self.code.len();
-                self.bytes(&[0x41, 0x8A, 0x34, 0x08]); // mov sil, [r8+rcx] (sil, not al: al is rax's low byte and rax holds strobj live through the copy; loading a char into al rewrites the pointer and every later store lands wild)
-                self.bytes(&[0x48, 0x88, 0xB4, 0x08, 0x10, 0x00, 0x00, 0x00]); // mov [rax+rcx+16], sil (rcx index: REX.X clear)
-                self.bytes(&[0x48, 0xFF, 0xC1]); // inc rcx
+                self.bytes(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp] (strobj)
+                self.bytes(&[0x48, 0x8D, 0x70, 0x10]); // lea rsi, [rax+16]
+                self.bytes(&[0x31, 0xC9]); // xor ecx, ecx (byte index)
+                let mut labels: std::collections::HashMap<&'static str, usize> =
+                    std::collections::HashMap::new();
+                let mut fixups: Vec<(usize, &'static str)> = Vec::new();
+
+                labels.insert("head", self.code.len());
                 self.bytes(&[0x48, 0x39, 0xD1]); // cmp rcx, rdx
-                let jl_copy = self.code.len();
-                self.bytes(&[0x7C, 0x00]); // jl copy_head
-                let copy_done = self.code.len();
-                self.code[jz_copy + 1] = (copy_done - (jz_copy + 2)) as i8 as u8;
-                self.code[jl_copy + 1] = (copy_head as i32 - (jl_copy + 2) as i32) as i8 as u8;
-                self.bytes(&[0x58]); // pop rax (restore strobj)
+                self.branch32(&[0x0F, 0x83], &mut fixups, "done"); // jae done
+                self.bytes(&[0x41, 0x0F, 0xB6, 0x04, 0x08]); // movzx eax, byte [r8+rcx]
+                self.bytes(&[0x3D, 0x80, 0x00, 0x00, 0x00]); // cmp eax, 0x80
+                self.branch32(&[0x0F, 0x82], &mut fixups, "one"); // jb one
+                // 0x80..0xC1 are stray continuation bytes or overlong
+                // leads; neither can begin a valid sequence.
+                self.bytes(&[0x3D, 0xC2, 0x00, 0x00, 0x00]); // cmp eax, 0xC2
+                self.branch32(&[0x0F, 0x82], &mut fixups, "invalid"); // jb invalid
+                self.bytes(&[0x3D, 0xE0, 0x00, 0x00, 0x00]); // cmp eax, 0xE0
+                self.branch32(&[0x0F, 0x82], &mut fixups, "two"); // jb two
+                self.bytes(&[0x3D, 0xF0, 0x00, 0x00, 0x00]); // cmp eax, 0xF0
+                self.branch32(&[0x0F, 0x82], &mut fixups, "three"); // jb three
+                self.branch32(&[0xE9], &mut fixups, "four"); // jmp four
+
+                labels.insert("one", self.code.len());
+                self.bytes(&[0x66, 0x89, 0x06]); // mov [rsi], ax
+                self.bytes(&[0x48, 0x83, 0xC6, 0x02]); // add rsi, 2
+                self.bytes(&[0x48, 0xFF, 0xC1]); // inc rcx
+                self.branch32(&[0xE9], &mut fixups, "head"); // jmp head
+
+                labels.insert("two", self.code.len());
+                self.bytes(&[0x4C, 0x8D, 0x49, 0x01]); // lea r9, [rcx+1]
+                self.bytes(&[0x49, 0x39, 0xD1]); // cmp r9, rdx
+                self.branch32(&[0x0F, 0x83], &mut fixups, "invalid"); // jae invalid
+                self.bytes(&[0x45, 0x0F, 0xB6, 0x4C, 0x08, 0x01]); // movzx r9d, [r8+rcx+1]
+                self.bytes(&[0x45, 0x89, 0xCA]); // mov r10d, r9d
+                self.bytes(&[0x41, 0x83, 0xE2, 0xC0]); // and r10d, 0xC0
+                self.bytes(&[0x41, 0x81, 0xFA, 0x80, 0x00, 0x00, 0x00]); // cmp r10d, 0x80
+                self.branch32(&[0x0F, 0x85], &mut fixups, "invalid"); // jne invalid
+                self.bytes(&[0x83, 0xE0, 0x1F]); // and eax, 0x1F
+                self.bytes(&[0xC1, 0xE0, 0x06]); // shl eax, 6
+                self.bytes(&[0x41, 0x83, 0xE1, 0x3F]); // and r9d, 0x3F
+                self.bytes(&[0x44, 0x09, 0xC8]); // or eax, r9d
+                self.bytes(&[0x66, 0x89, 0x06]); // mov [rsi], ax
+                self.bytes(&[0x48, 0x83, 0xC6, 0x02]); // add rsi, 2
+                self.bytes(&[0x48, 0x83, 0xC1, 0x02]); // add rcx, 2
+                self.branch32(&[0xE9], &mut fixups, "head"); // jmp head
+
+                labels.insert("three", self.code.len());
+                // b1
+                self.bytes(&[0x4C, 0x8D, 0x49, 0x01]); // lea r9, [rcx+1]
+                self.bytes(&[0x49, 0x39, 0xD1]); // cmp r9, rdx
+                self.branch32(&[0x0F, 0x83], &mut fixups, "invalid");
+                self.bytes(&[0x45, 0x0F, 0xB6, 0x4C, 0x08, 0x01]); // movzx r9d, [r8+rcx+1]
+                self.bytes(&[0x45, 0x89, 0xCA]); // mov r10d, r9d
+                self.bytes(&[0x41, 0x83, 0xE2, 0xC0]); // and r10d, 0xC0
+                self.bytes(&[0x41, 0x81, 0xFA, 0x80, 0x00, 0x00, 0x00]); // cmp r10d, 0x80
+                self.branch32(&[0x0F, 0x85], &mut fixups, "invalid");
+                // b2
+                self.bytes(&[0x4C, 0x8D, 0x51, 0x02]); // lea r10, [rcx+2]
+                self.bytes(&[0x49, 0x39, 0xD2]); // cmp r10, rdx
+                self.branch32(&[0x0F, 0x83], &mut fixups, "invalid");
+                self.bytes(&[0x45, 0x0F, 0xB6, 0x54, 0x08, 0x02]); // movzx r10d, [r8+rcx+2]
+                self.bytes(&[0x45, 0x89, 0xD3]); // mov r11d, r10d
+                self.bytes(&[0x41, 0x83, 0xE3, 0xC0]); // and r11d, 0xC0
+                self.bytes(&[0x41, 0x81, 0xFB, 0x80, 0x00, 0x00, 0x00]); // cmp r11d, 0x80
+                self.branch32(&[0x0F, 0x85], &mut fixups, "invalid");
+                self.bytes(&[0x83, 0xE0, 0x0F]); // and eax, 0x0F
+                self.bytes(&[0xC1, 0xE0, 0x0C]); // shl eax, 12
+                self.bytes(&[0x41, 0x83, 0xE1, 0x3F]); // and r9d, 0x3F
+                self.bytes(&[0x41, 0xC1, 0xE1, 0x06]); // shl r9d, 6
+                self.bytes(&[0x44, 0x09, 0xC8]); // or eax, r9d
+                self.bytes(&[0x41, 0x83, 0xE2, 0x3F]); // and r10d, 0x3F
+                self.bytes(&[0x44, 0x09, 0xD0]); // or eax, r10d
+                // Overlong (< U+0800) and surrogate code points are not
+                // valid UTF-8; they become U+FFFD below.
+                self.bytes(&[0x3D, 0x00, 0x08, 0x00, 0x00]); // cmp eax, 0x800
+                self.branch32(&[0x0F, 0x82], &mut fixups, "invalid"); // jb invalid
+                self.bytes(&[0x3D, 0x00, 0xD8, 0x00, 0x00]); // cmp eax, 0xD800
+                self.branch32(&[0x0F, 0x82], &mut fixups, "ok3"); // jb ok3
+                self.bytes(&[0x3D, 0xFF, 0xDF, 0x00, 0x00]); // cmp eax, 0xDFFF
+                self.branch32(&[0x0F, 0x86], &mut fixups, "invalid"); // jbe invalid
+                labels.insert("ok3", self.code.len());
+                self.bytes(&[0x66, 0x89, 0x06]); // mov [rsi], ax
+                self.bytes(&[0x48, 0x83, 0xC6, 0x02]); // add rsi, 2
+                self.bytes(&[0x48, 0x83, 0xC1, 0x03]); // add rcx, 3
+                self.branch32(&[0xE9], &mut fixups, "head");
+
+                labels.insert("four", self.code.len());
+                // b1
+                self.bytes(&[0x4C, 0x8D, 0x49, 0x01]); // lea r9, [rcx+1]
+                self.bytes(&[0x49, 0x39, 0xD1]); // cmp r9, rdx
+                self.branch32(&[0x0F, 0x83], &mut fixups, "invalid");
+                self.bytes(&[0x45, 0x0F, 0xB6, 0x4C, 0x08, 0x01]); // movzx r9d, [r8+rcx+1]
+                self.bytes(&[0x45, 0x89, 0xCA]); // mov r10d, r9d
+                self.bytes(&[0x41, 0x83, 0xE2, 0xC0]); // and r10d, 0xC0
+                self.bytes(&[0x41, 0x81, 0xFA, 0x80, 0x00, 0x00, 0x00]); // cmp r10d, 0x80
+                self.branch32(&[0x0F, 0x85], &mut fixups, "invalid");
+                self.bytes(&[0x83, 0xE0, 0x07]); // and eax, 7
+                self.bytes(&[0xC1, 0xE0, 0x12]); // shl eax, 18
+                self.bytes(&[0x41, 0x83, 0xE1, 0x3F]); // and r9d, 0x3F
+                self.bytes(&[0x41, 0xC1, 0xE1, 0x0C]); // shl r9d, 12
+                self.bytes(&[0x44, 0x09, 0xC8]); // or eax, r9d
+                // b2
+                self.bytes(&[0x4C, 0x8D, 0x51, 0x02]); // lea r10, [rcx+2]
+                self.bytes(&[0x49, 0x39, 0xD2]); // cmp r10, rdx
+                self.branch32(&[0x0F, 0x83], &mut fixups, "invalid");
+                self.bytes(&[0x45, 0x0F, 0xB6, 0x54, 0x08, 0x02]); // movzx r10d, [r8+rcx+2]
+                self.bytes(&[0x45, 0x89, 0xD1]); // mov r9d, r10d
+                self.bytes(&[0x41, 0x83, 0xE1, 0xC0]); // and r9d, 0xC0
+                self.bytes(&[0x41, 0x81, 0xF9, 0x80, 0x00, 0x00, 0x00]); // cmp r9d, 0x80
+                self.branch32(&[0x0F, 0x85], &mut fixups, "invalid");
+                self.bytes(&[0x41, 0x83, 0xE2, 0x3F]); // and r10d, 0x3F
+                self.bytes(&[0x41, 0xC1, 0xE2, 0x06]); // shl r10d, 6
+                self.bytes(&[0x44, 0x09, 0xD0]); // or eax, r10d
+                // b3
+                self.bytes(&[0x4C, 0x8D, 0x59, 0x03]); // lea r11, [rcx+3]
+                self.bytes(&[0x49, 0x39, 0xD3]); // cmp r11, rdx
+                self.branch32(&[0x0F, 0x83], &mut fixups, "invalid");
+                self.bytes(&[0x45, 0x0F, 0xB6, 0x5C, 0x08, 0x03]); // movzx r11d, [r8+rcx+3]
+                self.bytes(&[0x45, 0x89, 0xDA]); // mov r10d, r11d
+                self.bytes(&[0x41, 0x83, 0xE2, 0xC0]); // and r10d, 0xC0
+                self.bytes(&[0x41, 0x81, 0xFA, 0x80, 0x00, 0x00, 0x00]); // cmp r10d, 0x80
+                self.branch32(&[0x0F, 0x85], &mut fixups, "invalid");
+                self.bytes(&[0x41, 0x83, 0xE3, 0x3F]); // and r11d, 0x3F
+                self.bytes(&[0x44, 0x09, 0xD8]); // or eax, r11d
+                // Overlong (< U+10000) and above U+10FFFF are invalid.
+                self.bytes(&[0x3D, 0x00, 0x00, 0x01, 0x00]); // cmp eax, 0x10000
+                self.branch32(&[0x0F, 0x82], &mut fixups, "invalid"); // jb invalid
+                self.bytes(&[0x3D, 0xFF, 0xFF, 0x10, 0x00]); // cmp eax, 0x10FFFF
+                self.branch32(&[0x0F, 0x87], &mut fixups, "invalid"); // ja invalid
+                self.bytes(&[0x2D, 0x00, 0x00, 0x01, 0x00]); // sub eax, 0x10000
+                self.bytes(&[0x41, 0x89, 0xC1]); // mov r9d, eax
+                self.bytes(&[0x41, 0xC1, 0xE9, 0x0A]); // shr r9d, 10
+                self.bytes(&[0x41, 0x81, 0xC1, 0x00, 0xD8, 0x00, 0x00]); // add r9d, 0xD800
+                self.bytes(&[0x66, 0x44, 0x89, 0x0E]); // mov [rsi], r9w
+                self.bytes(&[0x48, 0x83, 0xC6, 0x02]); // add rsi, 2
+                self.bytes(&[0x25, 0xFF, 0x03, 0x00, 0x00]); // and eax, 0x3FF
+                self.bytes(&[0x05, 0x00, 0xDC, 0x00, 0x00]); // add eax, 0xDC00
+                self.bytes(&[0x66, 0x89, 0x06]); // mov [rsi], ax
+                self.bytes(&[0x48, 0x83, 0xC6, 0x02]); // add rsi, 2
+                self.bytes(&[0x48, 0x83, 0xC1, 0x04]); // add rcx, 4
+                self.branch32(&[0xE9], &mut fixups, "head");
+
+                // Truncated or malformed sequence: one U+FFFD, skip the
+                // lead byte. Continuation bytes are bounds-checked before
+                // every read, so a bad string cannot over-read.
+                labels.insert("invalid", self.code.len());
+                self.bytes(&[0x66, 0xC7, 0x06, 0xFD, 0xFF]); // mov word [rsi], 0xFFFD
+                self.bytes(&[0x48, 0x83, 0xC6, 0x02]); // add rsi, 2
+                self.bytes(&[0x48, 0xFF, 0xC1]); // inc rcx
+                self.branch32(&[0xE9], &mut fixups, "head");
+
+                labels.insert("done", self.code.len());
+                for (site, name) in fixups {
+                    let target = labels[name] as i32;
+                    let rel = target - (site + 4) as i32;
+                    self.code[site..site + 4].copy_from_slice(&rel.to_le_bytes());
+                }
+                self.bytes(&[0x58]); // pop rax (strobj)
+                self.bytes(&[0x41, 0x5B]); // pop r11 (outer arg index)
+                self.bytes(&[0x41, 0x59]); // pop r9 (kernel argv pointer)
+                // Header length is the code-unit count, not the byte count.
+                self.bytes(&[0x48, 0x89, 0xF1]); // mov rcx, rsi
+                self.bytes(&[0x48, 0x29, 0xC1]); // sub rcx, rax
+                self.bytes(&[0x48, 0x83, 0xE9, 0x10]); // sub rcx, 16
+                self.bytes(&[0x48, 0xD1, 0xE9]); // shr rcx, 1
+                self.bytes(&[0x48, 0x89, 0x08]); // mov [rax], rcx
                 self.bytes(&[0x4A, 0x89, 0x44, 0xDF, 0x10]); // mov [rdi+r11*8+16], rax (rdi base is reg 7: REX.B clear; X set; +16 like NewArray, never the +8 refcount slot)
                 self.bytes(&[0x49, 0xFF, 0xC3]); // inc r11
                 self.bytes(&[rex(true, true, false), 0x3B, modrm(0, 3, 7)]); // cmp r11, [rdi]: opcode 0x3B (r64, r/m64) so jge skips when i >= length; 0x39 would compare backwards and skip whenever length > 0
@@ -1407,33 +1618,40 @@ impl<'p> Emitter<'p> {
     fn bin(&mut self, alloc: &regalloc::Allocation, dst: VReg, op: BinOp, a: VReg, b: VReg) {
         let dl = alloc.loc[dst.0 as usize];
 
-        if matches!(op, BinOp::Div | BinOp::Rem) {
+        if matches!(op, BinOp::Div | BinOp::Rem | BinOp::UDiv | BinOp::URem) {
             // Zero divisor yields zero instead of trapping with
             // SIGFPE (C# would throw DivideByZeroException; static
             // exes have no throwing runtime here, and
             // not-yet-implemented paths — e.g. generic-math statics
             // evaluating 0/0 during init — must produce a value, not
-            // abort the image). Div takes the quotient (rax), Rem the
-            // remainder (rdx).
+            // abort the image). Div/UDiv take the quotient (rax),
+            // Rem/URem the remainder (rdx).
+            let unsigned = matches!(op, BinOp::UDiv | BinOp::URem);
             self.get(RAX, alloc.loc[a.0 as usize]);
             self.get(R11, alloc.loc[b.0 as usize]);
             self.bytes(&[0x4D, 0x85, modrm(0b11, R11, R11)]); // test r11, r11
             let jz_zero = self.code.len();
             self.bytes(&[0x74, 0x00]); // jz div_zero
-            self.bytes(&[0x48, 0x99]); // cqo
-            self.bytes(&[rex(true, false, true), 0xF7, modrm(0b11, 7, R11)]); // idiv r11
+            if unsigned {
+                // div divides rdx:rax; clear the high half.
+                self.bytes(&[0x31, 0xD2]); // xor edx, edx
+                self.bytes(&[rex(true, false, true), 0xF7, modrm(0b11, 6, R11)]); // div r11
+            } else {
+                self.bytes(&[0x48, 0x99]); // cqo
+                self.bytes(&[rex(true, false, true), 0xF7, modrm(0b11, 7, R11)]); // idiv r11
+            }
             let jmp_done = self.code.len();
             self.bytes(&[0xEB, 0x00]); // jmp div_done
             let zero_at = self.code.len();
             self.code[jz_zero + 1] = (zero_at - (jz_zero + 2)) as i8 as u8;
-            if op == BinOp::Rem {
+            if matches!(op, BinOp::Rem | BinOp::URem) {
                 self.bytes(&[0x31, 0xD2]); // xor edx, edx
             } else {
                 self.bytes(&[0x31, 0xC0]); // xor eax, eax
             }
             let done_at = self.code.len();
             self.code[jmp_done + 1] = (done_at - (jmp_done + 2)) as i8 as u8;
-            if op == BinOp::Rem {
+            if matches!(op, BinOp::Rem | BinOp::URem) {
                 // Remainder rides in rdx; route it into the destination.
                 match dl {
                     Loc::Reg(dr) => self.mov_rr(dr.id(), 2),
@@ -1473,7 +1691,7 @@ impl<'p> Emitter<'p> {
             BinOp::BitAnd => &[0x23],
             BinOp::BitOr => &[0x0B],
             BinOp::BitXor => &[0x33],
-            BinOp::Div | BinOp::Rem => unreachable!("handled above"),
+            BinOp::Div | BinOp::Rem | BinOp::UDiv | BinOp::URem => unreachable!("handled above"),
             BinOp::Shl | BinOp::Shr | BinOp::ShrShr => unreachable!("handled above"),
             BinOp::Is => unreachable!("lowered to Const in IR"),
         };
@@ -1514,6 +1732,8 @@ impl<'p> Emitter<'p> {
                         BinOp::BitXor => &[0x33],
                         BinOp::Div
                         | BinOp::Rem
+                        | BinOp::UDiv
+                        | BinOp::URem
                         | BinOp::Shl
                         | BinOp::Shr
                         | BinOp::ShrShr

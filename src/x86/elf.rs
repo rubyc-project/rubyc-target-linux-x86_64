@@ -140,14 +140,10 @@ impl ImageWriter for Writer {
                     code_blob_vaddr + mc.helper_exc_clear.unwrap_or(0) as u64
                 }
                 rubyc::native::target::Sym::ExcState(off) => data_vaddr + *off as u64,
-                // Startup-saved rsp slot: last 8 data bytes whenever the
-                // argv helper exists (backend appends slot with helper).
+                // Startup argv slot, at the offset recorded when the
+                // backend appended it.
                 rubyc::native::target::Sym::ArgvRsp => {
-                    if mc.helper_argv.is_some() && !mc.data.is_empty() {
-                        data_vaddr + mc.data.len() as u64 - 8
-                    } else {
-                        data_vaddr
-                    }
+                    data_vaddr + mc.helper_argv.unwrap_or(0) as u64
                 }
                 rubyc::native::target::Sym::Import(i) => {
                     code_blob_vaddr

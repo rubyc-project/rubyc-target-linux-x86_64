@@ -90,6 +90,13 @@ fn uses_and_defs(instr: &Instr) -> (Option<u32>, Vec<u32>) {
             u.push(dst.0); // receiver/args are uses; dst counts too
             (Some(dst.0), u)
         }
+        // Indirect call: the TARGET register is a use as well as the args.
+        Instr::CallFnAddr { dst, target, args } => {
+            let mut u: Vec<u32> = args.iter().map(|v| v.0).collect();
+            u.push(target.0);
+            u.push(dst.0);
+            (Some(dst.0), u)
+        }
         // Address import: pure def, no register operands.
         Instr::LoadImport { dst, .. } => (Some(dst.0), vec![dst.0]),
         // The receiver is an operand like any other — omitting it here
@@ -105,6 +112,7 @@ fn uses_and_defs(instr: &Instr) -> (Option<u32>, Vec<u32>) {
             (Some(dst.0), u)
         }
         Instr::Alloc { dst, .. } | Instr::VTableAddr { dst, .. } | Instr::LoadStaticAddr { dst, .. }
+        | Instr::FnAddr { dst, .. }
         | Instr::StackAlloc { dst, .. } | Instr::LoadStrAddr { dst, .. } => (Some(dst.0), vec![]),
         // Process argv: defines the array vreg, reads no vregs (the
         // kernel stack comes from the startup slot, not the frame).

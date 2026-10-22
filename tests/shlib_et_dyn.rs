@@ -387,3 +387,91 @@ fn dt_init_points_at_init_fn() {
         }
     }
 }
+
+/// Parse a section header by type: (sh_offset, sh_size, sh_link).
+fn section_by_type(img: &[u8], want: u32) -> Option<(usize, usize, usize)> {
+    let shoff = read_u64(img, 40) as usize;
+    let shentsize = read_u16(img, 58) as usize;
+    let shnum = read_u16(img, 60) as usize;
+    for i in 0..shnum {
+        let at = shoff + i * shentsize;
+        if read_u32(img, at + 4) == want {
+            return Some((
+                read_u64(img, at + 24) as usize,
+                read_u64(img, at + 32) as usize,
+                read_u32(img, at + 40) as usize,
+            ));
+        }
+    }
+    None
+}
+
+#[test]
+fn dependency_images_are_needed_and_bound_at_load_time() {
+    // A `.so`-hinted import is a runtime dependency: DT_NEEDED names the
+    // image, the symbol is undefined in .dynsym, and a GLOB_DAT slot is
+    // filled by the loader. No body is copied.
+    let mut mc = bare_mc();
+    // movabs rax, <import> ; ret — site is the immediate (offset 2).
+    mc.code = vec![0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc3];
+    mc.fn_bases = vec![0];
+    mc.import_names = vec![("Lib.so".to_owned(), "Ns.C::f#0".to_owned())];
+    mc.import_bases = vec![usize::MAX];
+    mc.relocs = vec![Reloc {
+        kind: RelocKind::Abs64,
+        section: Section::Code,
+        site: 2,
+        sym: Sym::Import(0),
+    }];
+    let img = write_shared_library(&mc).unwrap();
+
+    let (dyn_off, dyn_size, _) = section_by_type(&img, 6).expect("SHT_DYNAMIC");
+    let (sym_off, sym_size, sym_link) = section_by_type(&img, 11).expect("SHT_DYNSYM");
+    let (str_off, _, _) = section_by_type(&img, 3).expect("SHT_STRTAB");
+    let dynstr = {
+        // The dynamic symbol table links to its string table.
+        let shoff = read_u64(&img, 40) as usize;
+        let shentsize = read_u16(&img, 58) as usize;
+        let at = shoff + sym_link * shentsize;
+        read_u64(&img, at + 24) as usize
+    };
+    let str_at = |off: usize| {
+        let start = str_off + off;
+        let end = img[start..].iter().position(|&b| b == 0).unwrap() + start;
+        String::from_utf8_lossy(&img[start..end]).into_owned()
+    };
+
+    let mut saw_needed = false;
+    let mut saw_init = false;
+    for e in 0..dyn_size / 16 {
+        let at = dyn_off + e * 16;
+        match read_u64(&img, at) {
+            1 => {
+                saw_needed = true;
+                assert_eq!(str_at(read_u64(&img, at + 8) as usize), "Lib.so");
+            }
+            12 => saw_init = true,
+            // Tag 19 is DT_RELENT, not DT_RELACOUNT; the writer used to
+            // emit it with the wrong meaning.
+            19 => panic!("DT_RELENT must not be emitted"),
+            _ => {}
+        }
+    }
+    assert!(saw_needed, "DT_NEEDED for the dependency image");
+    assert!(!saw_init, "no initializer means no DT_INIT (0 calls the base)");
+
+    let (rela_off, rela_size, _) = section_by_type(&img, 4).expect("SHT_RELA");
+    let mut saw_glob = false;
+    for e in 0..rela_size / 24 {
+        let at = rela_off + e * 24;
+        let info = read_u64(&img, at + 8);
+        if info & 0xffff_ffff == 6 {
+            saw_glob = true;
+            let sym = (info >> 32) as usize;
+            assert!(sym * 24 < sym_size);
+            let name_off = read_u32(&img, sym_off + sym * 24) as usize;
+            assert_eq!(str_at(name_off), "Ns.C::f#0");
+        }
+    }
+    assert!(saw_glob, "GLOB_DAT binds the dependency symbol");
+}
